@@ -1,0 +1,17 @@
+{
+    "name": "hookjson",
+    "version": "0.1.0",
+    "type": "module",
+    "bin": {
+        "hookjson": "./src/cli.ts"
+    },
+    "scripts": {
+        "test": "bun test",
+        "lint": "biome check src/ tests/",
+        "format": "biome check --write src/ tests/"
+    },
+    "devDependencies": {
+        "@biomejs/biome": "^1.9.4",
+        "bun-types": "^1.3.10"
+    }
+}

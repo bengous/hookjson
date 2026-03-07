@@ -63,20 +63,25 @@ async function git(repo: string, args: string[]): Promise<{ stdout: string; stde
     return { stdout, stderr, exitCode };
 }
 
-function extractNdjsonLine(output: string): Record<string, unknown> | null {
+function extractAllNdjsonLines(output: string): Record<string, unknown>[] {
+    const results: Record<string, unknown>[] = [];
     for (const line of output.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed.startsWith('{')) continue;
         try {
             const parsed = JSON.parse(trimmed);
             if (typeof parsed === 'object' && parsed !== null && 'tool' in parsed) {
-                return parsed as Record<string, unknown>;
+                results.push(parsed as Record<string, unknown>);
             }
         } catch {
             // not JSON, skip
         }
     }
-    return null;
+    return results;
+}
+
+function extractNdjsonLine(output: string): Record<string, unknown> | null {
+    return extractAllNdjsonLines(output)[0] ?? null;
 }
 
 function expectNdjson(result: { stdout: string; stderr: string }): Record<string, unknown> {
@@ -88,6 +93,18 @@ function expectNdjson(result: { stdout: string; stderr: string }): Record<string
 function hookScript(command: string, jsonMode = false): string {
     const env = jsonMode ? 'HOOKS_FORMAT=json ' : '';
     return `#!/usr/bin/env bash\n${env}exec bun "${CLI_PATH}" --tool lint -- ${command}\n`;
+}
+
+function multiHookScript(commands: Array<{ tool: string; command: string }>, jsonMode: boolean): string {
+    const lines = ['#!/usr/bin/env bash', 'set -euo pipefail'];
+    for (const { tool, command } of commands) {
+        if (jsonMode) {
+            lines.push(`HOOKS_FORMAT=json bun "${CLI_PATH}" --tool ${tool} -- ${command}`);
+        } else {
+            lines.push(command);
+        }
+    }
+    return `${lines.join('\n')}\n`;
 }
 
 // ── Stale cleanup ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -211,6 +228,126 @@ describe('e2e: hookjson as git hook', () => {
                     expect(exitCode).not.toBe(0);
                 }),
             10_000,
+        );
+    });
+});
+
+// ── Multi-command hook tests (lefthook-style) ────────────────────────────────────────────────────────────────────────
+
+const TOOLS_ALL_PASS: Array<{ tool: string; command: string }> = [
+    { tool: 'lint', command: 'echo "Checked 12 files in 5ms. No fixes applied."' },
+    { tool: 'test', command: `sh -c 'echo '"'"'{"suites":2,"tests":8,"pass":8,"fail":0}'"'"''` },
+    { tool: 'guard', command: 'echo "No absolute paths found."' },
+    { tool: 'links', command: 'echo "Links: 42 total, 0 broken"' },
+];
+
+const TOOLS_LINT_FAILS: Array<{ tool: string; command: string }> = [
+    { tool: 'lint', command: `sh -c 'echo "error: unused import" >&2; exit 1'` },
+    ...TOOLS_ALL_PASS.slice(1),
+];
+
+const TOOLS_TEST_FAILS: Array<{ tool: string; command: string }> = [
+    TOOLS_ALL_PASS[0],
+    {
+        tool: 'test',
+        command: `sh -c 'echo "test failed" >&2; echo '"'"'{"suites":2,"tests":8,"pass":7,"fail":1}'"'"'; exit 1'`,
+    },
+    ...TOOLS_ALL_PASS.slice(2),
+];
+
+describe('e2e: multi-command hook (lefthook-style)', () => {
+    describe('RED: without hookjson', () => {
+        test(
+            'all passing — human-readable output, no structured data',
+            () =>
+                withRepo(async (repo) => {
+                    await installHook(repo, 'pre-commit', multiHookScript(TOOLS_ALL_PASS, false));
+                    await Bun.write(join(repo, 'file.txt'), 'content\n');
+                    await git(repo, ['add', 'file.txt']);
+
+                    const result = await git(repo, ['commit', '-m', 'multi-pass']);
+                    const combined = `${result.stdout}\n${result.stderr}`;
+
+                    expect(result.exitCode).toBe(0);
+                    expect(combined).toContain('Checked 12 files');
+                    expect(combined).toContain('Links: 42 total');
+                    expect(extractAllNdjsonLines(combined)).toHaveLength(0);
+                    const log = await git(repo, ['log', '--oneline']);
+                    expect(log.stdout.trim().split('\n')).toHaveLength(2);
+                }),
+            15_000,
+        );
+
+        test(
+            'one failing — fail-fast stops execution',
+            () =>
+                withRepo(async (repo) => {
+                    await installHook(repo, 'pre-commit', multiHookScript(TOOLS_LINT_FAILS, false));
+                    await Bun.write(join(repo, 'file.txt'), 'content\n');
+                    await git(repo, ['add', 'file.txt']);
+
+                    const result = await git(repo, ['commit', '-m', 'should fail']);
+                    const combined = `${result.stdout}\n${result.stderr}`;
+
+                    expect(result.exitCode).not.toBe(0);
+                    expect(combined).toContain('error: unused import');
+                    expect(combined).not.toContain('Links');
+                    const log = await git(repo, ['log', '--oneline']);
+                    expect(log.stdout.trim().split('\n')).toHaveLength(1);
+                }),
+            15_000,
+        );
+    });
+
+    describe('GREEN: with hookjson', () => {
+        test(
+            'all passing — 4 NDJSON lines with correct tools and parsed JSON output',
+            () =>
+                withRepo(async (repo) => {
+                    await installHook(repo, 'pre-commit', multiHookScript(TOOLS_ALL_PASS, true));
+                    await Bun.write(join(repo, 'file.txt'), 'content\n');
+                    await git(repo, ['add', 'file.txt']);
+
+                    const result = await git(repo, ['commit', '-m', 'multi-json']);
+                    const combined = `${result.stdout}\n${result.stderr}`;
+                    const lines = extractAllNdjsonLines(combined);
+
+                    expect(result.exitCode).toBe(0);
+                    expect(lines).toHaveLength(4);
+                    expect(lines.map((l) => l.tool)).toEqual(['lint', 'test', 'guard', 'links']);
+                    for (const line of lines) {
+                        expect(line.success).toBe(true);
+                        expect(line.exit_code).toBe(0);
+                    }
+                    expect(lines[0].output).toBe('Checked 12 files in 5ms. No fixes applied.');
+                    expect(lines[1].output).toEqual({ suites: 2, tests: 8, pass: 8, fail: 0 });
+                }),
+            15_000,
+        );
+
+        test(
+            'mid-pipeline failure — partial NDJSON + fail-fast',
+            () =>
+                withRepo(async (repo) => {
+                    await installHook(repo, 'pre-commit', multiHookScript(TOOLS_TEST_FAILS, true));
+                    await Bun.write(join(repo, 'file.txt'), 'content\n');
+                    await git(repo, ['add', 'file.txt']);
+
+                    const result = await git(repo, ['commit', '-m', 'mid-fail']);
+                    const combined = `${result.stdout}\n${result.stderr}`;
+                    const lines = extractAllNdjsonLines(combined);
+
+                    expect(result.exitCode).not.toBe(0);
+                    expect(lines).toHaveLength(2);
+                    expect(lines[0].tool).toBe('lint');
+                    expect(lines[0].success).toBe(true);
+                    expect(lines[1].tool).toBe('test');
+                    expect(lines[1].success).toBe(false);
+                    expect(lines[1].exit_code).toBe(1);
+                    expect(lines[1].stderr).toBe('test failed');
+                    expect(lines[1].output).toEqual({ suites: 2, tests: 8, pass: 7, fail: 1 });
+                }),
+            15_000,
         );
     });
 });
